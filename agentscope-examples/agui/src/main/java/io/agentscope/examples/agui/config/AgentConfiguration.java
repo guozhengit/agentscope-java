@@ -30,15 +30,24 @@ import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.model.ExecutionConfig;
 import io.agentscope.core.model.GenerateOptions;
+import io.agentscope.core.model.transport.HttpTransport;
+import io.agentscope.core.model.transport.OkHttpTransport;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.examples.agui.tools.ExampleTools;
 import io.agentscope.extensions.model.openai.OpenAIChatModel;
 import io.agentscope.spring.boot.agui.common.AguiAgentRegistryCustomizer;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import okhttp3.Interceptor;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import reactor.core.publisher.Flux;
@@ -56,6 +65,8 @@ import reactor.core.publisher.Flux;
  */
 @Configuration
 public class AgentConfiguration {
+
+    private static final Logger log = LoggerFactory.getLogger(AgentConfiguration.class);
 
     @Bean
     public AguiAgentRegistryCustomizer aguiAgentRegistryCustomizer() {
@@ -246,7 +257,9 @@ public class AgentConfiguration {
      * <p>The relay's upstream is intermittently flaky (occasional HTTP 502 / "Upstream
      * service temporarily unavailable"), so retry/backoff is hardened beyond the framework
      * default: up to 4 attempts with exponential backoff, retrying all errors (auth already
-     * verified working, so no 4xx false-retry concern for this endpoint).
+     * verified working, so no 4xx false-retry concern for this endpoint). An additional
+     * transport-level retry (see {@link #buildMikuTransport()}) re-issues the raw HTTP call on 5xx
+     * before the agent loop even starts.
      */
     private OpenAIChatModel buildMikuModel() {
         String apiKey = System.getenv("MIKU_API_KEY");
@@ -263,6 +276,7 @@ public class AgentConfiguration {
                 .baseUrl(baseUrl)
                 .modelName(modelName)
                 .stream(true)
+                .httpTransport(buildMikuTransport())
                 .generateOptions(
                         GenerateOptions.builder().executionConfig(mikuExecutionConfig()).build())
                 .build();
@@ -290,6 +304,83 @@ public class AgentConfiguration {
                 .backoffMultiplier(2.0)
                 .retryOn(error -> true)
                 .build();
+    }
+
+    /**
+     * Build a custom {@link HttpTransport} with a transport-level retry interceptor.
+     *
+     * <p>The relay's upstream occasionally returns HTTP 502 ("Upstream service temporarily
+     * unavailable") or transient 429/5xx. The model/agent layer already retries the whole
+     * generation up to 4 times (see {@link #mikuExecutionConfig()}), but that re-runs the full
+     * reasoning loop. A transport-level retry re-issues only the underlying HTTP call on a 5xx,
+     * which is cheaper and catches the failure before the agent loop even starts. The two layers
+     * compose into defense-in-depth against the flaky relay.
+     *
+     * <p>Retry budget here is deliberately modest (3 attempts) to avoid multiplying with the
+     * agent-layer 4 attempts into an excessive tail latency. Exponential backoff is capped at 8s.
+     */
+    private static HttpTransport buildMikuTransport() {
+        OkHttpClient retryClient =
+                new OkHttpClient.Builder()
+                        .retryOnConnectionFailure(true)
+                        .addInterceptor(mikuRetryInterceptor())
+                        .build();
+        return OkHttpTransport.builder().client(retryClient).build();
+    }
+
+    /**
+     * OkHttp interceptor that retries idempotent POSTs on retryable status codes / IO failures.
+     *
+     * <p>Retryable statuses: 429 (rate limit), 500/502/503/504 (server errors). Non-retryable
+     * errors (e.g. 4xx auth/config) are returned as-is so the model layer can surface them.
+     */
+    private static Interceptor mikuRetryInterceptor() {
+        final int maxAttempts = 3;
+        final long initialBackoffMs = 1000L;
+        return chain -> {
+            Request request = chain.request();
+            IOException lastIo = null;
+            Response response = null;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    response = chain.proceed(request);
+                    int code = response.code();
+                    if (response.isSuccessful() || !isRetryableStatus(code)) {
+                        return response;
+                    }
+                    response.close();
+                    response = null;
+                } catch (IOException e) {
+                    lastIo = e;
+                }
+                if (attempt < maxAttempts) {
+                    long backoff = Math.min(initialBackoffMs * (1L << (attempt - 1)), 8000L);
+                    int code = response != null ? response.code() : -1;
+                    log.warn(
+                            "mikuapi relay transport retry: attempt {}/{} after {}ms (status={},"
+                                    + " io={})",
+                            attempt,
+                            maxAttempts,
+                            backoff,
+                            code,
+                            lastIo != null ? lastIo.getMessage() : "n/a");
+                    try {
+                        Thread.sleep(backoff);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+            if (response != null) {
+                return response;
+            }
+            throw lastIo != null ? lastIo : new IOException("mikuapi relay retry exhausted");
+        };
+    }
+
+    private static boolean isRetryableStatus(int code) {
+        return code == 429 || code == 500 || code == 502 || code == 503 || code == 504;
     }
 
     private static String envOrDefault(String name, String defaultValue) {
