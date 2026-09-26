@@ -26,7 +26,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  *
  * <p><b>Usage:</b>
  * <ol>
- *   <li>Set the DASHSCOPE_API_KEY environment variable</li>
+ *   <li>Set the MIKU_API_KEY environment variable (mikuapi.org OpenAI-compatible relay)</li>
  *   <li>Run this application</li>
  *   <li>Open http://localhost:8080 in a browser</li>
  *   <li>Or use curl: curl -X POST http://localhost:8080/agui/run -H "Content-Type: application/json" -d '{"threadId":"test","runId":"1","messages":[{"id":"m1","role":"user","content":"Hello!"}]}'</li>
